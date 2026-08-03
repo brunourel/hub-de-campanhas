@@ -1,23 +1,28 @@
-# Campaign Hub — Data Model
+# BORA — Data Model
 
 Postgres on Supabase. **RLS is enabled on every table in `public`, without exception**,
-including tables that look harmless (`cities`, `offer_events`). A table with RLS
-enabled and no policy denies everything, which is the correct default.
+including tables that look harmless (`cities`, `offer_events`, `slug_redirects`). A
+table with RLS enabled and no policy denies everything, which is the correct default.
+
+> **SSR does not bypass RLS.** The Vike server (B1) queries Supabase with the **anon
+> key**, exactly like a browser. Server rendering changes where the HTML is built, never
+> who is allowed to read. The service role key exists only inside edge functions and is
+> never present in any bundle, server or client.
 
 Conventions:
 
 - `id uuid primary key default gen_random_uuid()` unless stated otherwise.
-- `created_at timestamptz not null default now()`, `updated_at timestamptz not null default now()` maintained by a `set_updated_at()` trigger.
+- `created_at timestamptz not null default now()`, `updated_at` maintained by a `set_updated_at()` trigger.
 - Money is `numeric(12,2)`, never float.
-- Foreign keys are `on delete restrict` by default; cascades are called out explicitly.
-- Storage paths are stored as text keys, never as full URLs.
+- Foreign keys are `on delete restrict` unless a cascade is stated.
+- Storage paths are stored as bucket keys, never as full URLs.
 
-The four roles referenced in every policy table below:
+Roles referenced in every policy table:
 
 | Role | Meaning in policies |
 |---|---|
-| **anon** | Not logged in — the consumer browsing the public catalog. |
-| **consumer** | Logged in, Clube member. Same public read as `anon`, plus their own club rows. |
+| **anon** | Not logged in — the consumer, and the SSR server rendering on their behalf. |
+| **consumer** | Logged in. In v1 identical to `anon` in what it may read (A7). |
 | **restaurant** | Owner of exactly one `restaurants` row (A3, A4). |
 | **supplier** | Owner of exactly one `suppliers` row (A3). |
 | **admin** | Full read; writes limited to curation and approval columns. |
@@ -29,6 +34,7 @@ The four roles referenced in every policy table below:
 ```sql
 create type app_role          as enum ('admin','supplier','restaurant','consumer');
 create type approval_status   as enum ('pending','approved','rejected','suspended');
+create type campaign_kind     as enum ('oferta','experiencia');                 -- B2
 create type campaign_status   as enum ('draft','pending_review','approved','rejected','published','closed','archived');
 create type order_status      as enum ('draft','submitted','partially_approved','approved','rejected','cancelled');
 create type enrollment_status as enum ('pending_approval','approved','proof_submitted','min_order_confirmed','rejected','cancelled','expired');
@@ -37,24 +43,23 @@ create type proof_type        as enum ('nfe_pdf','nfe_xml','order_photo','distri
 create type asset_kind        as enum ('banner','social_post','story','print','video','guideline_pdf','logo','other');
 create type offer_status      as enum ('draft','published','unpublished');
 create type cta_type          as enum ('whatsapp','ifood','instagram','phone','maps','website');
-create type offer_event_type  as enum ('offer_view','cta_click','campaign_view','offer_save');
+create type offer_event_type  as enum ('city_view','campaign_view','restaurant_view','offer_view','cta_click','offer_save');
+create type entity_kind       as enum ('campaign','restaurant','city');         -- slug_redirects
 create type club_status       as enum ('active','unsubscribed');
 ```
 
 **The gate.** `enrollment_status = 'min_order_confirmed'` is the single condition that
 unlocks `campaign_assets`. It is enforced in three independent places: the RLS policy
 on `campaign_assets`, the storage policy on the `campaign-assets` bucket, and the edge
-function that mints signed URLs. Any one of them failing still leaves the assets
-locked.
+function that mints signed URLs. Any one of them failing still leaves the assets locked.
 
 ---
 
 ## 2. Helper functions
 
-All are `security definer`, `stable`, `set search_path = public`, and owned by the
-migration role. They exist so that policies never self-reference the table they
-protect (which is how RLS recursion bugs happen) and so the A3 → v2 migration to
-multi-user teams touches five functions instead of forty policies.
+`security definer`, `stable`, `set search_path = public`. They exist so policies never
+self-reference the table they protect (the classic RLS recursion bug) and so the v2
+migration to multi-user teams touches five functions instead of forty policies.
 
 ```sql
 create or replace function public.has_role(_user_id uuid, _role app_role)
@@ -68,7 +73,6 @@ returns boolean language sql stable security definer set search_path = public as
   select public.has_role(auth.uid(), 'admin');
 $$;
 
--- returns the supplier id only when the account is approved
 create or replace function public.current_supplier_id()
 returns uuid language sql stable security definer set search_path = public as $$
   select s.id from public.suppliers s
@@ -92,8 +96,9 @@ returns boolean language sql stable security definer set search_path = public as
   );
 $$;
 
--- an offer the public is allowed to see
-create or replace function public.is_offer_public(_offer_id uuid)
+-- Visible to the public at all: powers /restaurante/:slug and /campanha/:slug history.
+-- Deliberately has NO date condition — an indexed URL must never 404 (A15, A16).
+create or replace function public.is_offer_visible(_offer_id uuid)
 returns boolean language sql stable security definer set search_path = public as $$
   select exists (
     select 1
@@ -104,18 +109,27 @@ returns boolean language sql stable security definer set search_path = public as
     where o.id = _offer_id
       and o.status = 'published'
       and e.status = 'min_order_confirmed'
-      and c.status = 'published'
+      and c.status in ('published','closed')
       and r.status = 'approved'
-      and c.activation_date >= (now() at time zone 'America/Sao_Paulo')::date
   );
 $$;
 ```
 
-> **Column-level protection.** RLS filters rows, not columns. Sensitive columns
-> (`cnpj`, `legal_name`, `owner_id`, `contact_email`, `contact_phone`) are protected by
-> `revoke all on <table> from anon, authenticated;` followed by an explicit
-> `grant select (col, col, ...)` listing only public columns. The grant lists are given
-> per table below and are part of the migration, not an afterthought.
+**Visible ≠ live.** `is_offer_visible` decides *readability*. Whether an offer appears
+in the city catalog, carries the **"Campanha ativa"** badge, or is rendered as history
+is a query filter on `campaigns.activation_date`, not a permission:
+
+| Concept | Condition | Used by |
+|---|---|---|
+| live | `activation_date = hoje` | catalog, "Campanha ativa" badge |
+| upcoming | `activation_date > hoje` | catalog, "Acontece em DD/MM" |
+| history | `activation_date < hoje` | restaurant page, campaign page, `noindex` |
+
+> **Column-level protection.** RLS filters rows, not columns. `cnpj`, `legal_name`,
+> `owner_id`, `contact_email`, `whatsapp_phone` and `address_line` are protected by
+> `revoke all on <table> from anon, authenticated;` then an explicit
+> `grant select (col, …)` listing only the public columns. The grant lists below are
+> part of the migration, not an afterthought.
 
 ---
 
@@ -123,43 +137,38 @@ $$;
 
 ### 3.1 `user_roles`
 
-Roles live in their own table, never on `profiles`, so that a compromised or careless
-profile update can never grant a role.
+Roles live in their own table, never on `profiles`, so a careless profile update can
+never grant a role.
 
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid pk | |
 | user_id | uuid not null | → `auth.users(id)` on delete cascade |
 | role | app_role not null | |
-| granted_by | uuid null | → `auth.users(id)`, null for signup default |
+| granted_by | uuid null | → `auth.users(id)`; null for the signup default |
 | created_at | timestamptz | |
 
 Indexes: `unique (user_id, role)`, `index (role)`.
 
-A `handle_new_user()` trigger on `auth.users` inserts `profiles` + the signup role
-(`restaurant`, `supplier` or `consumer`, read from `raw_user_meta_data`). `admin` is
-never assignable this way — the trigger rejects it.
+A `handle_new_user()` trigger on `auth.users` inserts `profiles` plus the signup role
+read from `raw_user_meta_data`. `admin` is never assignable this way — the trigger
+rejects it.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | anon | ✗ | ✗ | ✗ | ✗ |
-| consumer / restaurant / supplier | own rows (`user_id = auth.uid()`) | ✗ | ✗ | ✗ |
-| admin | all | all except `role = 'admin'` on self | ✗ (revoke + insert instead) | all |
-
-Writes by non-admins happen only through the signup trigger (definer) or an edge
-function using the service role.
+| consumer / restaurant / supplier | own rows | ✗ | ✗ | ✗ |
+| admin | all | all, except granting `admin` to self | ✗ | all |
 
 ### 3.2 `profiles`
 
 | Column | Type | Notes |
 |---|---|---|
-| id | uuid pk | = `auth.users(id)`, on delete cascade |
+| id | uuid pk | = `auth.users(id)` on delete cascade |
 | full_name | text not null | |
 | phone | text null | E.164 |
 | avatar_path | text null | `public-media` |
 | created_at / updated_at | timestamptz | |
-
-Indexes: pk only.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
@@ -167,19 +176,22 @@ Indexes: pk only.
 | consumer / restaurant / supplier | own row | own row (trigger) | own row, cannot change `id` | ✗ |
 | admin | all | ✗ | ✗ | ✗ |
 
-Deliberately **not** readable across users: a supplier sees restaurant contacts through
+Deliberately not readable across users: a supplier reaches restaurant contacts through
 `restaurants`, never through `profiles`.
 
 ### 3.3 `cities`
 
+Every active city is an indexable landing page, so it carries its own SEO fields.
+
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid pk | |
-| name | text not null | |
-| state_uf | char(2) not null | |
-| slug | text not null | url-safe, e.g. `sao-paulo-sp` |
+| name | text not null / state_uf char(2) not null | |
+| slug | text not null | `sao-paulo-sp` — the `:cidade` segment |
+| seo_title | text null / seo_description text null | fall back to generated copy |
+| hero_image_path | text null | `public-media` |
 | is_active | boolean not null default true | |
-| created_at | timestamptz | |
+| created_at / updated_at | timestamptz | |
 
 Indexes: `unique (slug)`, `unique (lower(name), state_uf)`, `index (is_active) where is_active`.
 
@@ -187,9 +199,9 @@ Indexes: `unique (slug)`, `unique (lower(name), state_uf)`, `index (is_active) w
 |---|---|---|---|---|
 | anon / consumer | `is_active = true` | ✗ | ✗ | ✗ |
 | restaurant / supplier | `is_active = true` | ✗ | ✗ | ✗ |
-| admin | all | all | all | ✗ (deactivate instead; FK restrict would block anyway) |
+| admin | all | all | all | ✗ (deactivate; FK restrict would block anyway) |
 
-Grants: `grant select (id, name, state_uf, slug) on cities to anon, authenticated;`
+Grants (anon/authenticated): `id, name, state_uf, slug, seo_title, seo_description, hero_image_path`.
 
 ### 3.4 `suppliers`
 
@@ -197,28 +209,25 @@ Grants: `grant select (id, name, state_uf, slug) on cities to anon, authenticate
 |---|---|---|
 | id | uuid pk | |
 | owner_id | uuid not null | → `auth.users(id)`, **unique** (A3) |
-| brand_name | text not null | |
-| legal_name | text not null | |
-| cnpj | text not null | digits only, check-digit validated server-side |
+| brand_name | text not null / legal_name text not null | |
+| cnpj | text not null | digits only, check digits validated server-side |
 | slug | text not null | |
 | logo_path | text null | `public-media` |
 | description | text null | |
 | website_url / contact_email / contact_phone | text null | |
 | status | approval_status not null default 'pending' | |
-| rejection_reason | text null | |
-| reviewed_by | uuid null / reviewed_at | timestamptz null |
+| rejection_reason | text null / reviewed_by uuid null / reviewed_at timestamptz null | |
 | created_at / updated_at | timestamptz | |
 
 Indexes: `unique (owner_id)`, `unique (cnpj)`, `unique (slug)`, `index (status)`.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| anon / consumer | `status = 'approved'` (public columns only) | ✗ | ✗ | ✗ |
-| restaurant | `status = 'approved'` (public columns only) | ✗ | ✗ | ✗ |
-| supplier | own row (`owner_id = auth.uid()`), all columns | own row once, forced `status='pending'` | own row, **only** when `status in ('pending','rejected','approved')`; cannot write `status`, `reviewed_by`, `reviewed_at`, `rejection_reason` (blocked by trigger) | ✗ |
+| anon / consumer / restaurant | `status = 'approved'`, public columns only | ✗ | ✗ | ✗ |
+| supplier | own row, all columns | own row once, forced `status='pending'` | own row; cannot write `status`, `reviewed_*`, `rejection_reason` (trigger) | ✗ |
 | admin | all | ✗ | `status`, `rejection_reason`, `reviewed_*` only | ✗ |
 
-Grants: `grant select (id, brand_name, slug, logo_path, description, website_url) on suppliers to anon, authenticated;` — `cnpj`, `legal_name`, `owner_id` and contacts are **not** granted.
+Grants (anon/authenticated): `id, brand_name, slug, logo_path, description, website_url`. **Not** granted: `cnpj`, `legal_name`, `owner_id`, contacts.
 
 ### 3.5 `restaurants`
 
@@ -226,35 +235,41 @@ Grants: `grant select (id, brand_name, slug, logo_path, description, website_url
 |---|---|---|
 | id | uuid pk | |
 | owner_id | uuid not null | → `auth.users(id)`, **unique** (A3) |
-| name | text not null | |
-| slug | text not null | |
+| name | text not null / slug text not null | slug = `nome-cidade` on collision |
 | legal_name | text not null / cnpj text not null | |
-| city_id | uuid not null | → `cities(id)` (A4: exactly one) |
-| address_line / neighborhood / postal_code | text | |
-| cuisine_type | text null | |
+| city_id | uuid not null | → `cities(id)` — exactly one (A4) |
+| address_line / neighborhood / postal_code | text | `address_line` is private |
+| latitude / longitude | numeric null | for `Restaurant` JSON-LD, not for search (v3) |
+| cuisine_type | text null / price_range text null | `servesCuisine`, `priceRange` |
+| opening_hours | jsonb null | `openingHoursSpecification` |
 | opened_at | date null | drives the "menos de 1 ano" segment |
 | seats | int null | |
-| logo_path / cover_path | text null | `public-media` |
+| logo_path / cover_path / og_image_path | text null | `public-media` |
 | instagram_handle | text null | |
-| whatsapp_phone | text null | E.164 |
-| contact_email | text null | |
+| whatsapp_phone / contact_email | text null | private |
+| seo_description | text null | |
+| **first_offer_published_at** | timestamptz null | **B4 — set on the first published offer, never cleared** |
+| **published_offers_count** | int not null default 0 | trigger-maintained; drives the catalog |
 | status | approval_status not null default 'pending' | |
 | rejection_reason / reviewed_by / reviewed_at | | |
 | created_at / updated_at | timestamptz | |
 
 Indexes: `unique (owner_id)`, `unique (cnpj)`, `unique (slug)`, `index (city_id)`,
-`index (status)`, `index (city_id, status) where status = 'approved'`.
+`index (status)`, `index (city_id, status) where status = 'approved'`,
+`index (first_offer_published_at) where first_offer_published_at is not null` — the sitemap query.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| anon / consumer | `status = 'approved'` **and** the restaurant has at least one public offer (public columns only) | ✗ | ✗ | ✗ |
-| restaurant | own row, all columns | own row once, forced `status='pending'` | own row; cannot write `status`, `reviewed_*`, `rejection_reason` | ✗ |
-| supplier | rows that have an enrollment in one of the supplier's campaigns — **contact columns only after that enrollment is `approved` or beyond** (F7); enforced by two policies + a restricted view `supplier_restaurant_contacts` | ✗ | ✗ | ✗ |
+| anon / consumer | `status = 'approved'` **and** `first_offer_published_at is not null` (B4), public columns only | ✗ | ✗ | ✗ |
+| restaurant | own row, all columns | own row once, forced `status='pending'` | own row; cannot write `status`, `reviewed_*`, `first_offer_published_at`, `published_offers_count` | ✗ |
+| supplier | restaurants enrolled in own campaigns; **contact columns only once that enrollment is `approved` or beyond**, through the `supplier_restaurant_contacts` view | ✗ | ✗ | ✗ |
 | admin | all | ✗ | `status`, `rejection_reason`, `reviewed_*` | ✗ |
 
-Grants (anon/authenticated): `id, name, slug, city_id, neighborhood, cuisine_type, logo_path, cover_path, instagram_handle`. Not granted: `cnpj`, `legal_name`, `owner_id`, `address_line`, `postal_code`, `contact_email`, `whatsapp_phone`.
-The supplier's access to contact data goes through the view, which applies the
-`enrollment.status <> 'pending_approval'` condition.
+Grants (anon/authenticated): `id, name, slug, city_id, neighborhood, cuisine_type, price_range, opening_hours, latitude, longitude, logo_path, cover_path, og_image_path, instagram_handle, seo_description, opened_at`.
+**Not** granted: `cnpj`, `legal_name`, `owner_id`, `address_line`, `postal_code`, `contact_email`, `whatsapp_phone`, `seats`.
+
+> An approved restaurant with no published offer is invisible to `anon` — the 404 and
+> the sitemap exclusion in F3 are enforced by the policy, not by the router.
 
 ### 3.6 `campaigns`
 
@@ -262,10 +277,14 @@ The supplier's access to contact data goes through the view, which applies the
 |---|---|---|
 | id | uuid pk | |
 | supplier_id | uuid not null | → `suppliers(id)` |
-| slug | text not null | |
+| **kind** | campaign_kind not null default 'oferta' | **B2 — `experiencia` drives `Event` JSON-LD and `/experiencias/:cidade`** |
+| slug | text not null | the `:slug` segment |
 | title / subtitle / description | text | |
-| mechanics_description | text not null | what the restaurant must offer |
+| mechanics_description | text not null | what the restaurant must run |
 | cover_path | text null | `public-media` |
+| **og_image_path** | text null | **B3 — composed at publish time** |
+| og_image_generated_at | timestamptz null | regenerate when title/cover change |
+| seo_title / seo_description | text null | fall back to generated copy |
 | min_order_amount | numeric(12,2) not null check (> 0) | |
 | min_order_description | text not null | e.g. "10 barris de 30L" |
 | activation_date | date not null | **A2 — single national date** |
@@ -281,21 +300,20 @@ The supplier's access to contact data goes through the view, which applies the
 
 Checks: `enrollment_closes_at::date <= activation_date`, `proof_deadline <= activation_date`, `enrollment_opens_at < enrollment_closes_at`.
 
-Indexes: `unique (slug)`, `index (supplier_id)`, `index (status)`,
-`index (activation_date)`, `index (status, activation_date) where status = 'published'`.
+Indexes: `unique (slug)`, `index (supplier_id)`, `index (status)`, `index (activation_date)`,
+`index (status, kind, activation_date) where status = 'published'` — the catalog and `/experiencias`,
+`index (status, published_at) where status in ('published','closed')` — the sitemap.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| anon / consumer | `status = 'published'` and `activation_date >= today` (public columns) | ✗ | ✗ | ✗ |
-| restaurant | `status = 'published'` and the campaign targets the restaurant's city (via `campaign_cities`), **plus** any campaign it is enrolled in regardless of date | ✗ | ✗ | ✗ |
-| supplier | own campaigns (`supplier_id = current_supplier_id()`), any status | own campaigns, forced `status='draft'` | own campaigns while `status in ('draft','rejected')`; cannot write `status` directly (state transitions go through an edge function); `min_order_amount` and `activation_date` frozen once an approved enrollment exists (trigger) | own campaigns while `status = 'draft'` and no enrollments |
+| anon / consumer | `status in ('published','closed')` — past campaigns stay readable so their URLs never 404 (A16) | ✗ | ✗ | ✗ |
+| restaurant | same as anon, **plus** any campaign it is enrolled in, any status | ✗ | ✗ | ✗ |
+| supplier | own campaigns, any status | own, forced `status='draft'` | own while `status in ('draft','rejected')`; `status` transitions only via edge function; `min_order_amount` and `activation_date` frozen once an approved enrollment exists (trigger) | own while `draft` and no enrollments |
 | admin | all | ✗ | `status`, `rejection_reason`, `reviewed_*` | ✗ |
 
-Grants (anon/authenticated): everything except `reviewed_by`, `rejection_reason`.
+Grants (anon/authenticated): everything except `reviewed_by`, `rejection_reason`, `default_*`.
 
 ### 3.7 `campaign_cities`
-
-Join table — which cities a campaign runs in.
 
 | Column | Type |
 |---|---|
@@ -307,8 +325,8 @@ Index: `index (city_id)`.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| anon / consumer / restaurant | rows whose campaign is publicly visible | ✗ | ✗ | ✗ |
-| supplier | rows of own campaigns | own campaigns while `status in ('draft','rejected')` | ✗ | same condition as insert |
+| anon / consumer / restaurant | rows whose campaign is publicly readable | ✗ | ✗ | ✗ |
+| supplier | own campaigns | own while `status in ('draft','rejected')` | ✗ | same condition as insert |
 | admin | all | ✗ | ✗ | ✗ |
 
 ### 3.8 `campaign_assets` — **gated**
@@ -327,23 +345,22 @@ Index: `index (city_id)`.
 | created_at | timestamptz | |
 
 Indexes: `index (campaign_id)`, `index (campaign_id, sort_order)`,
-`index (campaign_id) where is_public_preview`.
+`unique (campaign_id) where is_public_preview` — the teaser is exclusive.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| anon / consumer | `is_public_preview = true` **and** campaign publicly visible | ✗ | ✗ | ✗ |
-| restaurant | `is_public_preview = true` for visible campaigns, **plus all assets where `has_unlocked_campaign(campaign_id)`** | ✗ | ✗ | ✗ |
-| supplier | assets of own campaigns | own campaigns | own campaigns | own campaigns, blocked once campaign is `published` |
+| anon / consumer | `is_public_preview = true` and campaign publicly readable | ✗ | ✗ | ✗ |
+| restaurant | the teaser, **plus every asset where `has_unlocked_campaign(campaign_id)`** | ✗ | ✗ | ✗ |
+| supplier | own campaigns | own campaigns | own campaigns | own campaigns, blocked once `published` |
 | admin | all | ✗ | ✗ | ✗ |
 
-A row being selectable never yields a file: `storage_path` is a bucket key, and the
-bucket has its own policy (§5). The client asks the `get-asset-url` edge function,
-which re-checks `has_unlocked_campaign` with the caller's JWT before minting a
-60-second signed URL.
+Reading the row never yields a file: `storage_path` is a bucket key and the bucket has
+its own policy (§5). The client calls `get-asset-url`, which re-checks the gate with
+the caller's JWT before minting a 60-second signed URL.
 
 ### 3.9 `campaign_orders`
 
-The "join several campaigns in a single order" container (F6).
+The "join several campaigns in one order" container (F10).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -354,13 +371,12 @@ The "join several campaigns in a single order" container (F6).
 | submitted_at | timestamptz null | |
 | created_at / updated_at | timestamptz | |
 
-Indexes: `index (restaurant_id)`, `index (restaurant_id, status)`,
-`unique (restaurant_id) where status = 'draft'` — one open cart per restaurant.
+Indexes: `index (restaurant_id, status)`, `unique (restaurant_id) where status = 'draft'` — one open cart per restaurant.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | anon / consumer | ✗ | ✗ | ✗ | ✗ |
-| restaurant | own orders | own, forced `status='draft'` | own while `status = 'draft'` (submit goes through an edge function) | own while `status = 'draft'` |
+| restaurant | own | own, forced `draft` | own while `draft` (submit goes through an edge function) | own while `draft` |
 | supplier | ✗ — suppliers see enrollments, never another supplier's basket | ✗ | ✗ | ✗ |
 | admin | all | ✗ | ✗ | ✗ |
 
@@ -369,43 +385,37 @@ Indexes: `index (restaurant_id)`, `index (restaurant_id, status)`,
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid pk | |
-| campaign_id | uuid not null | → `campaigns(id)` |
-| restaurant_id | uuid not null | → `restaurants(id)` |
+| campaign_id | uuid not null → `campaigns(id)` / restaurant_id uuid not null → `restaurants(id)` | |
 | order_id | uuid null | → `campaign_orders(id)` |
 | status | enrollment_status not null default 'pending_approval' | |
 | requested_at | timestamptz not null default now() | |
-| decided_at | timestamptz null / decided_by uuid null | supplier decision |
-| rejection_reason | text null | |
-| confirmed_amount | numeric(12,2) null | value validated from the proof |
-| confirmed_at | timestamptz null / confirmed_by uuid null | |
-| override_below_minimum | boolean not null default false | set when a supplier confirms below `min_order_amount` (F8) |
-| notes | text null | supplier-private note |
+| decided_at | timestamptz null / decided_by uuid null / rejection_reason text null | supplier decision |
+| confirmed_amount | numeric(12,2) null / confirmed_at timestamptz null / confirmed_by uuid null | |
+| override_below_minimum | boolean not null default false | set when confirmed below `min_order_amount` (F17) |
+| notes | text null | supplier-private |
 | created_at / updated_at | timestamptz | |
 
 Indexes: `unique (campaign_id, restaurant_id)`, `index (campaign_id, status)`,
-`index (restaurant_id, status)`, `index (order_id)`,
-`index (status) where status = 'approved'` (deadline sweeper).
+`index (restaurant_id, status)`, `index (order_id)`, `index (status) where status = 'approved'` (deadline sweeper).
 
-State machine (all transitions performed by edge functions, never by a raw client update):
+State machine — every transition runs in an edge function, never a raw client update:
 
 ```
 pending_approval ──approve──▶ approved ──proof sent──▶ proof_submitted
-       │                          │                          │
-       │                          │◀────── proof rejected ────┤
-       │                          │                          ▼
-       └──reject──▶ rejected      └──deadline──▶ expired   min_order_confirmed  ← THE GATE
+       │                         │                          │
+       │                         │◀───── proof rejected ─────┤
+       │                         │                          ▼
+       └──reject──▶ rejected     └──deadline──▶ expired   min_order_confirmed  ← THE GATE
                                                                   │
-restaurant may cancel while pending_approval/approved ──▶ cancelled
+restaurant may cancel while pending_approval / approved ──▶ cancelled
 ```
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | anon / consumer | ✗ | ✗ | ✗ | ✗ |
-| restaurant | own (`restaurant_id = current_restaurant_id()`), excluding `notes` | own, only for a `published` campaign inside its enrollment window, targeting its city, forced `status='pending_approval'` | own, **only** `status → 'cancelled'` while `status in ('pending_approval','approved')` | ✗ |
+| restaurant | own, `notes` revoked at column level | own, only for a `published` campaign inside its enrollment window targeting its city, forced `pending_approval` | own, **only** `status → 'cancelled'` while `pending_approval` or `approved` | ✗ |
 | supplier | enrollments of own campaigns | ✗ | own campaigns' rows: `status`, `decided_*`, `rejection_reason`, `confirmed_*`, `override_below_minimum`, `notes` | ✗ |
 | admin | all | ✗ | `status` (unblock/correct), always audited | ✗ |
-
-`notes` is revoked from the restaurant at column level.
 
 ### 3.11 `purchase_proofs`
 
@@ -418,10 +428,9 @@ restaurant may cancel while pending_approval/approved ──▶ cancelled
 | file_name / mime_type | text not null | |
 | size_bytes | bigint not null check (<= 10485760) | |
 | document_type | proof_type not null | |
-| nfe_key | text null check (nfe_key ~ '^\d{44}$') | stored for v2 automation and duplicate detection |
+| nfe_key | text null check (nfe_key ~ '^\d{44}$') | stored for v2 automation |
 | declared_amount | numeric(12,2) not null check (> 0) | |
-| purchase_date | date not null | |
-| distributor_name | text null | |
+| purchase_date | date not null / distributor_name text null | |
 | status | proof_status not null default 'submitted' | |
 | reviewed_by / reviewed_at / rejection_reason | | |
 | created_at | timestamptz | |
@@ -432,128 +441,136 @@ Indexes: `index (enrollment_id)`, `index (status)`,
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | anon / consumer | ✗ | ✗ | ✗ | ✗ |
-| restaurant | proofs of own enrollments | own enrollments, only while enrollment is `approved` or the previous proof was `rejected`, and only before `proof_deadline`; forced `status='submitted'` | ✗ | ✗ |
+| restaurant | proofs of own enrollments | own enrollments, only while `approved` or after a rejected proof, and only before `proof_deadline`; forced `status='submitted'` | ✗ | ✗ |
 | supplier | proofs of enrollments in own campaigns | ✗ | `status`, `reviewed_*`, `rejection_reason` on own campaigns' proofs | ✗ |
 | admin | all | ✗ | `status`, `reviewed_*` | ✗ |
 
-The declared amount is never trusted: the edge function that approves a proof
-re-reads `campaigns.min_order_amount` server-side and demands the explicit override
-flag when the value is lower.
+`declared_amount` is never trusted: `review-proof` re-reads `campaigns.min_order_amount`
+server-side and demands the explicit override flag when the value is lower.
 
 ### 3.12 `restaurant_offers`
 
-The restaurant's own public offer for one confirmed enrollment (F10). One offer per
-enrollment. `campaign_id`, `restaurant_id` and `city_id` are denormalised (kept in
-sync by trigger) so the public catalog query filters by city without joining four
-tables under an RLS policy.
+The restaurant's public offer for one confirmed enrollment (F13). One per enrollment.
+`campaign_id`, `restaurant_id` and `city_id` are denormalised (trigger-maintained) so
+the SSR catalog query filters by city without joining four tables under RLS.
 
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid pk | |
 | enrollment_id | uuid not null unique | → `campaign_enrollments(id)` on delete cascade |
-| campaign_id / restaurant_id / city_id | uuid not null | denormalised, trigger-maintained |
+| campaign_id / restaurant_id / city_id | uuid not null | denormalised |
 | headline | text not null check (length ≤ 80) | |
 | description | text not null check (length ≤ 400) | |
 | terms | text null | |
-| image_path | text null | `public-media`; falls back to campaign cover |
-| cta_type | cta_type not null | |
-| cta_value | text not null | phone or URL, normalised + validated server-side |
+| image_path | text null | `public-media`; falls back to the campaign cover |
+| cta_type | cta_type not null / cta_value text not null | normalised + validated server-side |
 | status | offer_status not null default 'draft' | |
-| published_at | timestamptz null | |
+| published_at | timestamptz null | first publication; also sets `restaurants.first_offer_published_at` |
 | created_at / updated_at | timestamptz | |
 
-Indexes: `unique (enrollment_id)`, `index (city_id, status) where status = 'published'`,
-`index (campaign_id)`, `index (restaurant_id)`.
+Indexes: `unique (enrollment_id)`, `index (city_id, status) where status = 'published'` — the catalog,
+`index (campaign_id, status)`, `index (restaurant_id, status)`.
+
+A trigger on publish sets `restaurants.first_offer_published_at` (once, never cleared)
+and maintains `published_offers_count` — the two columns behind B4.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| anon / consumer | `is_offer_public(id)` | ✗ | ✗ | ✗ |
-| restaurant | own offers, any status | own, **only when the enrollment is `min_order_confirmed`** and belongs to it | own; publishing requires a valid `cta_value` (trigger + edge function) | own while `status = 'draft'` |
+| anon / consumer | `is_offer_visible(id)` — no date condition (A16) | ✗ | ✗ | ✗ |
+| restaurant | own offers, any status | own, **only when the enrollment is `min_order_confirmed`** | own; publishing requires a valid `cta_value` (trigger + edge function) | own while `draft` |
 | supplier | offers attached to own campaigns, any status | ✗ | ✗ | ✗ |
 | admin | all | ✗ | `status` (takedown) | ✗ |
 
-### 3.13 `offer_events`
+### 3.13 `slug_redirects`
 
-Append-only analytics. **No client ever writes here.** The public site calls the
-`track-offer-event` edge function, which validates that the offer is public,
-rate-limits by `session_hash`, and inserts with the service role.
-
-| Column | Type | Notes |
-|---|---|---|
-| id | bigint generated always as identity, pk | high volume |
-| offer_id | uuid null | → `restaurant_offers(id)` on delete set null |
-| campaign_id / restaurant_id / city_id | uuid not null | denormalised for aggregation |
-| event_type | offer_event_type not null | |
-| occurred_at | timestamptz not null default now() | |
-| session_hash | text not null | salted hash of IP + UA + date (A11) — **no raw IP, ever** |
-| referrer_host | text null / user_agent_family text null / device_kind text null | |
-| club_member_id | uuid null | → `club_members(id)`, only for logged-in members |
-
-Indexes: `index (offer_id, occurred_at desc)`,
-`index (campaign_id, event_type, occurred_at desc)`,
-`index (city_id, occurred_at desc)`,
-`unique (offer_id, session_hash, event_type, (occurred_at::date))` for `offer_view` — one view per offer per session per day (F13).
-
-| Role | SELECT | INSERT | UPDATE | DELETE |
-|---|---|---|---|---|
-| anon / consumer | ✗ (write-only surface, and even the write is indirect) | ✗ | ✗ | ✗ |
-| restaurant | events of own offers | ✗ | ✗ | ✗ |
-| supplier | events of own campaigns | ✗ | ✗ | ✗ |
-| admin | all | ✗ | ✗ | ✗ |
-
-A `offer_daily_metrics` view aggregates by `(offer_id, date, event_type)` and inherits
-the same visibility through `security_invoker = true`.
-
-### 3.14 `club_members`
+A15 — an indexed URL never 404s. Written by a trigger whenever a slug changes.
 
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid pk | |
-| user_id | uuid not null unique | → `auth.users(id)` on delete cascade (A7) |
-| email | text not null | snapshot for mailing |
+| entity | entity_kind not null | campaign / restaurant / city |
+| old_slug | text not null | |
+| new_slug | text not null | |
+| created_at | timestamptz | |
+
+Indexes: `unique (entity, old_slug)`, `index (entity, new_slug)`.
+
+| Role | SELECT | INSERT | UPDATE | DELETE |
+|---|---|---|---|---|
+| anon / consumer / restaurant / supplier | all (it is public routing data) | ✗ | ✗ | ✗ |
+| admin | all | ✗ | ✗ | ✗ |
+
+The SSR router resolves a 404 against this table before rendering the error page and
+answers 301 when it finds a match. Chains are collapsed to the final slug on write.
+
+### 3.14 `offer_events`
+
+Append-only analytics. **No client ever writes here.** The public pages call the
+`track-offer-event` edge function, which validates visibility, rate-limits by
+`session_hash`, and inserts with the service role.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | bigint generated always as identity, pk | |
+| event_type | offer_event_type not null | includes `city_view`, `campaign_view`, `restaurant_view` for the SEO funnel |
+| offer_id | uuid null | → `restaurant_offers(id)` on delete set null |
+| campaign_id / restaurant_id | uuid null | denormalised |
+| city_id | uuid not null | every public page belongs to a city |
+| occurred_at | timestamptz not null default now() | |
+| session_hash | text not null | salted hash of IP + UA + date (A11) — **no raw IP, ever** |
+| referrer_host | text null / utm_source text null / device_kind text null | `referrer_host` only, never the full URL |
+| created_date | date generated always as (…) stored | dedup + rollup key |
+
+Indexes: `index (offer_id, occurred_at desc)`, `index (campaign_id, event_type, occurred_at desc)`,
+`index (city_id, occurred_at desc)`,
+`unique (offer_id, session_hash, event_type, created_date) where event_type = 'offer_view'` — one view per offer per session per day (F5).
+
+| Role | SELECT | INSERT | UPDATE | DELETE |
+|---|---|---|---|---|
+| anon / consumer | ✗ — write-only surface, and even the write is indirect | ✗ | ✗ | ✗ |
+| restaurant | events of own offers | ✗ | ✗ | ✗ |
+| supplier | events of own campaigns | ✗ | ✗ | ✗ |
+| admin | all | ✗ | ✗ | ✗ |
+
+`offer_daily_metrics` aggregates by `(offer_id, created_date, event_type)` with
+`security_invoker = true`, inheriting the same visibility.
+
+### 3.15 `club_members` — **v2 table, v1 uses it only as an email capture (A7)**
+
+| Column | Type | Notes |
+|---|---|---|
+| id | uuid pk | |
+| user_id | uuid null unique | → `auth.users(id)` on delete cascade — **null in v1**, filled when the Clube ships |
+| email | text not null | |
 | full_name | text null / phone text null | |
-| city_id | uuid not null | → `cities(id)` |
+| city_id | uuid not null | → `cities(id)` — what they asked to be alerted about |
+| source | text not null default 'city_empty_state' | where the capture happened |
 | accepts_marketing | boolean not null default true | |
 | accepted_terms_at | timestamptz not null | LGPD consent timestamp |
 | status | club_status not null default 'active' | |
 | unsubscribe_token | uuid not null default gen_random_uuid() | one-click unsubscribe |
 | created_at / updated_at | timestamptz | |
 
-Indexes: `unique (user_id)`, `index (city_id) where status = 'active'`, `unique (unsubscribe_token)`.
+Indexes: `unique (user_id) where user_id is not null`, `unique (lower(email), city_id)`,
+`index (city_id) where status = 'active'`, `unique (unsubscribe_token)`.
 
 | Role | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| anon | ✗ (signup goes through an edge function) | ✗ | ✗ | ✗ |
-| consumer | own row | own row once | own row, cannot write `unsubscribe_token` | own row (LGPD deletion) |
-| restaurant / supplier | ✗ — **the member list is never sold or exposed** | ✗ | ✗ | ✗ |
-| admin | aggregate counts via a view; the raw table only for support | ✗ | `status` | own-request deletion |
+| anon | ✗ — signup goes through the `join-club` edge function, so the table is never exposed to a form | ✗ | ✗ | ✗ |
+| consumer | own row (v2) | ✗ | own row, cannot write `unsubscribe_token` | own row (LGPD deletion) |
+| restaurant / supplier | ✗ — **the list is never exposed or sold** | ✗ | ✗ | ✗ |
+| admin | aggregate counts via a view; raw rows only for support | ✗ | `status` | on request |
 
-### 3.15 `club_saved_offers`
-
-| Column | Type |
-|---|---|
-| club_member_id | uuid not null → `club_members(id)` on delete cascade |
-| offer_id | uuid not null → `restaurant_offers(id)` on delete cascade |
-| created_at | timestamptz |
-| pk (club_member_id, offer_id) |
-
-Index: `index (offer_id)`.
-
-| Role | SELECT | INSERT | UPDATE | DELETE |
-|---|---|---|---|---|
-| anon | ✗ | ✗ | ✗ | ✗ |
-| consumer | own rows | own rows, only when `is_offer_public(offer_id)` | ✗ | own rows |
-| restaurant / supplier | ✗ (they see the aggregate `offer_save` count via `offer_events`) | ✗ | ✗ | ✗ |
-| admin | ✗ | ✗ | ✗ | ✗ |
+`club_saved_offers` (member ↔ offer, pk on both columns) is defined in v2 with the
+Clube itself; it has no purpose while there is no login.
 
 ### 3.16 `audit_log`
 
 | Column | Type | Notes |
 |---|---|---|
 | id | bigint identity pk | |
-| actor_id | uuid null | → `auth.users(id)` |
-| actor_role | app_role null | |
-| action | text not null | `supplier.approved`, `enrollment.confirmed`, … |
+| actor_id | uuid null / actor_role app_role null | |
+| action | text not null | `supplier.approved`, `enrollment.confirmed`, `campaign.taken_down`, … |
 | entity_table | text not null / entity_id uuid not null | |
 | before / after | jsonb null | changed columns only |
 | reason | text null | |
@@ -566,7 +583,8 @@ Indexes: `index (entity_table, entity_id, created_at desc)`, `index (actor_id, c
 | anon / consumer / restaurant / supplier | ✗ | ✗ | ✗ | ✗ |
 | admin | all | ✗ | ✗ | ✗ |
 
-Written only by definer triggers and edge functions.
+Written only by definer triggers and edge functions. No edit or delete path exists for
+anyone, including admins (F19).
 
 ---
 
@@ -577,77 +595,91 @@ auth.users ─1:1─ profiles
 auth.users ─1:N─ user_roles
 auth.users ─1:1─ suppliers            (A3)
 auth.users ─1:1─ restaurants          (A3)
-auth.users ─1:1─ club_members         (A7)
 
 cities ─1:N─ restaurants
 cities ─N:N─ campaigns                (campaign_cities)
 cities ─1:N─ club_members
 
-suppliers ─1:N─ campaigns
+suppliers ─1:N─ campaigns  (kind: oferta | experiencia)
 campaigns ─1:N─ campaign_assets                       [gated]
 campaigns ─1:N─ campaign_enrollments ─N:1─ restaurants
 campaign_orders ─1:N─ campaign_enrollments            (multi-join in one order)
 campaign_enrollments ─1:N─ purchase_proofs
 campaign_enrollments ─1:1─ restaurant_offers
 restaurant_offers ─1:N─ offer_events
-restaurant_offers ─N:N─ club_members  (club_saved_offers)
+
+slug_redirects ─▶ campaigns | restaurants | cities    (301, by slug)
 ```
 
----
+## 5. Public routes → queries
 
-## 5. Storage buckets and policies
+| Route | Reads | Indexable when |
+|---|---|---|
+| `/` | active cities | always |
+| `/ofertas/:cidade` | offers where `is_offer_visible` and `activation_date >= hoje`, joined to campaign + restaurant | city active |
+| `/experiencias/:cidade` | same, filtered `campaigns.kind = 'experiencia'` | city active |
+| `/campanha/:slug` | campaign `published`/`closed` + its visible offers, city-filtered | `status = 'published'` and `activation_date >= hoje`; otherwise `noindex`, still 200 |
+| `/restaurante/:slug` | restaurant with `first_offer_published_at is not null` + its visible offers | always once public (B4) |
+| `/sitemap.xml` | active cities + published campaigns + indexable restaurants | — |
+
+## 6. Storage buckets and policies
 
 | Bucket | Public | Contents | Path convention |
 |---|---|---|---|
-| `public-media` | yes | logos, covers, offer images | `suppliers/{id}/…`, `restaurants/{id}/…`, `offers/{id}/…` |
+| `public-media` | yes | logos, covers, offer images, **OG images** | `suppliers/{id}/…`, `restaurants/{id}/…`, `offers/{id}/…`, `og/campaigns/{id}.png` |
 | `campaign-assets` | **no** | Media Kit / Tool Kit | `campaigns/{campaign_id}/{asset_id}.{ext}` |
 | `purchase-proofs` | **no** | NF-e, receipts, photos | `{restaurant_id}/{enrollment_id}/{proof_id}.{ext}` |
 
-`storage.objects` policies:
+- `public-media` — read: everyone. Write: the owner of the entity in the first two path segments. `og/` is writable only by the service role (B3).
+- `campaign-assets` — read: `is_admin()`, the owning supplier, or a restaurant with `has_unlocked_campaign(<campaign_id from the path>)`. Write: owning supplier. In practice the client never reads the bucket directly; `get-asset-url` mints a 60-second signed URL after re-checking the gate. The bucket policy is the second lock, not the only one.
+- `purchase-proofs` — read: the owning restaurant, the supplier of that enrollment's campaign, `is_admin()`. Write: the owning restaurant, only under its own `{restaurant_id}/` prefix. No public read under any condition.
 
-- `public-media` — read: everyone. Write/update/delete: the owner of the entity in the first two path segments (`suppliers/{current_supplier_id()}/…`, etc.).
-- `campaign-assets` — read: `is_admin()`, the owning supplier, **or** a restaurant with `has_unlocked_campaign(<campaign_id parsed from the path>)`. Write: owning supplier only. In practice the client never reads the bucket directly; the `get-asset-url` edge function mints a 60-second signed URL after re-checking the gate. The bucket policy is the second lock, not the only one.
-- `purchase-proofs` — read: the owning restaurant, the supplier of that enrollment's campaign, `is_admin()`. Write: the owning restaurant only, and only under its own `{restaurant_id}/` prefix. No public read under any condition.
+## 7. Edge functions
 
-## 6. Edge functions (server-side validation, service role never in the frontend)
+The service role key lives here and nowhere else.
 
 | Function | Why it cannot be a client write |
 |---|---|
-| `submit-campaign-order` | validates the whole cart atomically: campaign published, city matches, window open, capacity available, no duplicate enrollment; returns per-campaign results (F6). |
-| `decide-enrollment` | supplier approve/reject with capacity re-check under a lock. |
-| `submit-proof` | file type/size, NF-e key format and uniqueness, deadline check. |
-| `review-proof` | compares `declared_amount` against `min_order_amount`, requires the override flag, flips the enrollment to `min_order_confirmed`, writes the audit row. |
+| `submit-campaign-order` | validates the whole cart atomically — published, city matches, window open, capacity free, no duplicate — and returns per-campaign results (F10). |
+| `decide-enrollment` | supplier approve/reject with a capacity re-check under lock. |
+| `submit-proof` | file type/size, NF-e key format and uniqueness, deadline. |
+| `review-proof` | compares `declared_amount` to `min_order_amount`, requires the override flag, flips the enrollment to `min_order_confirmed`, writes the audit row. |
 | `get-asset-url` | re-checks the gate, mints a short-lived signed URL. |
-| `publish-offer` | normalises and validates `cta_value` per `cta_type`, checks the enrollment is confirmed. |
-| `track-offer-event` | validates offer visibility, rate-limits, computes `session_hash`, inserts without exposing the table. |
-| `join-club` / `unsubscribe-club` | LGPD consent record, token handling. |
+| `publish-offer` | normalises and validates `cta_value` per `cta_type`, confirms the enrollment, sets `first_offer_published_at`. |
+| `generate-og-image` | B3 — composes the share card once at publish and stores it in `public-media/og/`. |
+| `track-offer-event` | validates visibility, rate-limits, computes `session_hash`, inserts without exposing the table. |
+| `join-club` | A7 — email capture with LGPD consent, so `club_members` needs no anon insert policy. |
 | `admin-review-account` / `admin-review-campaign` | approval + audit + email. |
 | `expire-enrollments` (cron) | flips `approved` past `proof_deadline` to `expired`. |
+| `refresh-sitemap` (cron + on publish) | regenerates `sitemap.xml` from the DB. |
 
-## 7. RLS verification matrix
+## 8. RLS verification matrix
 
 Every policy is proven by a test that **attempts the forbidden read and asserts zero
-rows or a 403**, not just by a test that the allowed read works.
+rows or a 403** — not merely that the allowed read works.
 
 | # | Actor | Attempt | Expected |
 |---|---|---|---|
-| 1 | anon | `select * from campaign_assets` | only `is_public_preview` rows |
-| 2 | restaurant with enrollment `approved` (no proof) | select assets of that campaign | 0 rows |
-| 3 | restaurant with `proof_submitted` | select assets of that campaign | 0 rows |
-| 4 | restaurant with `min_order_confirmed` | select assets of that campaign | all rows |
+| 1 | anon | `select * from campaign_assets` | only the `is_public_preview` row |
+| 2 | restaurant with enrollment `approved` (no proof) | select that campaign's assets | 0 rows |
+| 3 | restaurant with `proof_submitted` | select that campaign's assets | 0 rows |
+| 4 | restaurant with `min_order_confirmed` | select that campaign's assets | all rows |
 | 5 | restaurant A confirmed in campaign X | select assets of campaign Y | 0 rows |
-| 6 | restaurant A | download signed URL of restaurant B's proof | 403 |
-| 7 | supplier A | select `campaigns` of supplier B | 0 rows |
+| 6 | restaurant A | fetch a signed URL for restaurant B's proof | 403 |
+| 7 | supplier A | select supplier B's campaigns | 0 rows |
 | 8 | supplier A | select `offer_events` of supplier B's campaigns | 0 rows |
-| 9 | supplier | select `restaurants.whatsapp_phone` of a `pending_approval` enrollment | null / 0 rows |
-| 10 | restaurant | `update campaign_enrollments set status='min_order_confirmed'` on own row | rejected |
-| 11 | restaurant | `update restaurants set status='approved'` on own row | rejected |
+| 9 | supplier | select `whatsapp_phone` of a `pending_approval` enrollment's restaurant | 0 rows / denied |
+| 10 | restaurant | `update campaign_enrollments set status='min_order_confirmed'` on its own row | rejected |
+| 11 | restaurant | `update restaurants set status='approved'` on its own row | rejected |
 | 12 | any authenticated user | `insert into user_roles (auth.uid(),'admin')` | rejected |
 | 13 | any authenticated user | `insert into offer_events …` | rejected |
-| 14 | supplier | select `club_members` | 0 rows |
+| 14 | supplier | `select * from club_members` | 0 rows |
 | 15 | anon | select an offer whose enrollment is not confirmed | 0 rows |
-| 16 | anon | select an offer whose campaign date has passed | 0 rows |
-| 17 | anon | select `restaurants.cnpj` | permission denied for column |
-| 18 | restaurant | select `campaign_enrollments.notes` of own row | permission denied for column |
+| 16 | anon | select an approved restaurant with `first_offer_published_at is null` | 0 rows |
+| 17 | anon | `select cnpj from restaurants` | permission denied for column |
+| 18 | restaurant | `select notes from campaign_enrollments` on its own row | permission denied for column |
 | 19 | supplier | `update campaigns set min_order_amount` after an approved enrollment | rejected by trigger |
-| 20 | restaurant | insert a second proof with an `nfe_key` already used | unique violation |
+| 20 | restaurant | insert a second proof reusing an existing `nfe_key` | unique violation |
+| 21 | anon | select a `draft` or `pending_review` campaign | 0 rows |
+| 22 | anon | request `/sitemap.xml` | contains only active cities, published campaigns and indexable restaurants |
+| 23 | anon (SSR server) | any public page query with the anon key | returns exactly what a browser would get — SSR grants no extra visibility |

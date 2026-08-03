@@ -1,255 +1,337 @@
-# Campaign Hub — Escopo v1
+# BORA — Escopo v1
 
-> **Purpose (one sentence):** Campaign Hub connects suppliers who fund ready-made
-> marketing campaigns with young restaurants who lack budget and structure, so that
-> every participating restaurant in a city runs the same offer on the same day and
-> fills empty tables as part of a visible movement instead of an isolated promo.
+**BORA** — Benefícios, Ofertas, Restaurantes, Ativações.
+*"Bora é onde o consumidor acha o rolê e a marca acha o restaurante."*
 
-**Language of these docs:** technical prose in English (mirroring the brief), all
-user-facing copy in Brazilian Portuguese and quoted verbatim. Identifiers, table
-names and enum values are English snake_case.
+> **Purpose (one sentence):** BORA is a public discovery product where anyone searching
+> for offers and things to do in their city finds restaurants running the same
+> supplier-funded campaign on the same day — and that consumer demand is what makes a
+> supplier pay to put its brand, its budget and its ready-made Media Kit behind
+> restaurants that could never afford marketing alone.
+
+**Language of these docs:** technical prose in English, all user-facing copy in
+Brazilian Portuguese and quoted verbatim. Identifiers, tables and enums are English
+snake_case.
 
 ---
 
 ## 0. Assumptions
 
-Decisions confirmed with the product owner before writing this document:
+### 0.1 Decisions confirmed with the product owner
 
 | # | Topic | Decision |
 |---|---|---|
-| A1 | Proof of minimum purchase | The restaurant uploads a document (NF-e PDF/XML, distributor order, or photo) and **the supplier approves or rejects it manually**. No SEFAZ/NF-e API integration in v1; the NF-e access key is stored as text for future automated validation and duplicate detection. |
-| A2 | Campaign timing | Each campaign has **one national activation date** set by the supplier. Every enrolled restaurant publishes on that day. The restaurant chooses whether to join, never when to run it. |
-| A3 | Accounts | **One user = one company.** The owner who signs up *is* the supplier/restaurant account. Team members with invites are v2. |
-| A4 | Restaurant granularity | **One registration = one location in one city.** A chain registers each unit separately. A `restaurant_units` table is explicitly v3. |
-| A5 | Consumer CTA | The CTA is **always an external link** (WhatsApp, iFood, Instagram, phone, Google Maps, own website). We track views and clicks. No vouchers, no redemption codes, no counter validation in v1. |
+| A1 | Proof of minimum purchase | The restaurant uploads a document (NF-e PDF/XML, distributor order, or photo) and **the supplier approves or rejects it manually**. No ERP or SEFAZ integration in the MVP. The NF-e access key is stored as text for future automation and duplicate detection. |
+| A2 | Campaign timing | Each campaign has **one national activation date**. Every enrolled restaurant publishes on that day. The restaurant chooses whether to join, never when to run it. |
+| A3 | Accounts | **One user = one company.** The owner who signs up *is* the supplier/restaurant account. Teams with invites are v2. |
+| A4 | Restaurant granularity | **One registration = one location in one city.** Chains register each unit separately. `restaurant_units` is v3. |
+| A5 | Consumer CTA | Always an **external link** (WhatsApp, iFood, Instagram, phone, Google Maps, own site). Views and clicks are tracked. No vouchers, no redemption codes in v1. |
+| B1 | Rendering | **Vike (SSR on top of Vite).** Public pages are server-rendered on every request: real HTML, per-page meta, canonical and JSON-LD, fresh data. The private areas stay client-rendered in the same codebase and the same build. |
+| B2 | Experiences | An experience is **a kind of campaign**, not a separate entity: `campaigns.kind ∈ ('oferta','experiencia')`. `Event` JSON-LD is generated from the campaign's national activation date. `/experiencias/:cidade` is the catalog filtered by kind, with its own canonical. |
+| B3 | OG images | Composed **once at publish time** by an edge function and stored in `public-media`. Served by CDN — no per-request rendering, no crawler timeouts. |
+| B4 | Restaurant page indexing | `/restaurante/:slug` becomes public and enters the sitemap when the restaurant publishes its **first offer**, and stays online forever after that (history + upcoming dates). Approved restaurants with no offer yet are `noindex` and absent from the sitemap. |
 
-Assumptions made without asking (flagged so they are cheap to challenge):
+### 0.2 Assumptions made without asking
 
 | # | Topic | Assumption |
 |---|---|---|
-| A6 | Market & locale | Brazil only. Currency `BRL`, timezone `America/Sao_Paulo`, dates rendered `dd/MM/yyyy`, money rendered `R$ 1.234,56`. All timestamps stored as `timestamptz` in UTC. |
-| A7 | Consumer auth | Browsing the public catalog **never** requires login. "Clube de Experiências" signup uses Supabase Auth (email + magic link / OTP) and only unlocks saved offers and city alerts. |
-| A8 | Cities | Cities are a **curated list managed by admin**, not free text and not an IBGE import. A campaign explicitly selects the cities it runs in. |
-| A9 | Email | Transactional email (approval, rejection, proof reviewed, campaign reminder) is sent from **edge functions** via a provider API key held server-side. Templates in Portuguese. Emails are v1 but the last slice built. |
-| A10 | Storage | Three buckets: `campaign-assets` (private, gated), `purchase-proofs` (private), `public-media` (public: logos, covers, offer images). Gated downloads are served as short-lived signed URLs minted by an edge function, never by a direct client call. |
-| A11 | Analytics identity | Consumer events are anonymous. We store a daily rotating `session_hash` (salted hash of IP + user agent + date), never a raw IP. This is our LGPD posture for v1. |
-| A12 | Approval model | A restaurant needs **two green lights** to appear publicly: admin approves the restaurant account once, and the supplier approves each enrollment. |
-| A13 | Enrollment capacity | A campaign may cap the number of restaurants (`max_restaurants`). When null there is no cap. Approval order is first-come, supplier-decided; there is no waiting list in v1. |
-| A14 | Money | The platform handles **no payments**. Supplier billing happens offline/commercially. `min_order_amount` is a threshold to verify, never a charge. |
-| A15 | Offer lifecycle | An offer auto-hides from the public catalog after its campaign activation date passes. Historical rows are kept for analytics, not deleted. |
+| A6 | Market & locale | Brazil only. `BRL`, `America/Sao_Paulo`, dates `dd/MM/yyyy`, money `R$ 1.234,56`. All timestamps stored `timestamptz` in UTC. `pt-BR` is the only locale; no i18n framework. |
+| A7 | Clube de Experiências | **Out of v1** (confirmed). v1 ships only an email capture — "Avise-me quando houver ofertas em {cidade}" — writing to `club_members` with no login and no emails sent yet. Saved offers, city alerts and exclusive events are v2. If even the capture is unwanted, it is one form and one edge function to remove. |
+| A8 | Cities | A **curated list managed by admin**, not free text and not an IBGE import. Each campaign explicitly selects its cities. A city page only exists once the city is active. |
+| A9 | Email | Transactional email (approvals, rejections, proof reviewed, activation-day reminder) is sent from edge functions with the provider key held server-side. Portuguese templates. Built in the last slice. |
+| A10 | Storage | Three buckets: `campaign-assets` (private, gated), `purchase-proofs` (private), `public-media` (public: logos, covers, offer and OG images). Gated downloads are short-lived signed URLs minted by an edge function, never a direct client read. |
+| A11 | Analytics identity | Consumer events are anonymous: a daily rotating `session_hash` (salted hash of IP + user agent + date). **No raw IP is ever stored.** This is the LGPD posture for v1. |
+| A12 | Approval model | A restaurant needs **two green lights** to appear publicly: admin approves the account once, the supplier approves each enrollment. |
+| A13 | Capacity | A campaign may cap restaurants (`max_restaurants`); null means uncapped. First-come, supplier-decided. No waiting list in v1. |
+| A14 | Money | The platform processes **no payments**. Supplier billing is commercial and offline. `min_order_amount` is a threshold to verify, never a charge. |
+| A15 | URL permanence | Slugs are permanent. Renaming an entity keeps the old slug alive as a 301 (`slug_redirects`). An indexed URL never 404s and never silently changes meaning. |
+| A16 | Past content | A finished campaign page stays online as history with `noindex` removed only if it still carries value; it never 404s and it always links to what is live now. Offer rows are kept for analytics, never deleted. |
+| A17 | Fonts | Google Sans is licensed-only. The stack ships `Google Sans Flex` → `Roboto` → `system-ui` and swaps in Google Sans behind a single CSS variable if a licence arrives. |
+| A18 | Brand orange | `#EA5B0C` is a placeholder in `--brand-600`. Swapping it is a one-line change in `index.css` — no JSX touches it. |
 
 ---
 
 ## 1. Features
 
-Each feature lists acceptance criteria as **"the user can X and sees Y"**. Every
-criterion is a testable statement; the four screen states (empty / loading / error /
-success) are mandatory across all data screens and are re-stated per feature only
-where the behaviour is non-obvious.
+Acceptance criteria are written as **"the user can X and sees Y"**. Empty, loading,
+error and success states are mandatory on every data screen (F20) and are only
+re-stated per feature where the behaviour is non-obvious.
 
-### F1 — Authentication and role routing
+---
 
-Email + password signup and login, with a role chosen at signup (`restaurante` or
-`fornecedor`); `consumidor` is created implicitly by the Clube signup; `admin` is
-assigned only by another admin.
+### Block A — Consumer discovery (the front door, built first)
 
-**Acceptance criteria**
-- The user can sign up as a restaurant and sees the account-pending screen "Cadastro em análise", not the restaurant dashboard.
-- The user can sign up as a supplier and sees the same pending state with supplier copy.
-- The user can log in and is routed to the area of their role without ever seeing a flash of another role's layout.
-- The user can hit a URL belonging to another role and sees a 403 page with a link back to their own area — never a blank screen and never the protected data.
-- The user can reload any protected page and stays logged in and on that page.
-- The user can request a password reset and sees a confirmation message whether or not the email exists (no account enumeration).
-- The user cannot change their own role from the client; attempting it fails server-side and the UI never offers it.
+### F1 — Public catalog by city
 
-### F2 — Admin approval of suppliers and restaurants
+Route `/ofertas/:cidade`. Server-rendered. No login, ever.
 
 **Acceptance criteria**
-- The admin can open "Cadastros pendentes" and sees a list of suppliers and restaurants awaiting review with submission date, city and CNPJ.
-- The admin can approve an account and sees it move to "Aprovados"; the owner's next login lands on their working dashboard.
-- The admin can reject an account with a mandatory reason and sees it move to "Recusados"; the owner sees the reason and an "Editar cadastro" action that returns them to `pending`.
-- The admin can suspend an approved account and sees its campaigns/offers disappear from the public catalog within the same request cycle.
-- With nothing pending, the admin sees the empty state "Nenhum cadastro aguardando análise", not an empty table with headers.
+- Any visitor can open the home page and sees the hero **"As melhores ofertas da sua cidade, no mesmo dia."** with a city selector and the header CTAs **"Sou Restaurante"** / **"Sou Fornecedor"**.
+- The visitor can pick a city and lands on `/ofertas/:cidade`, seeing only offers live in that city, ordered by activation date then restaurant name.
+- The visitor can view the page with JavaScript disabled and still sees the full list of offers in the HTML source.
+- The visitor can share the URL and the recipient sees exactly the same page.
+- The visitor sees a **"Campanha ativa"** badge on offers running today, and "Acontece em DD/MM" on upcoming ones.
+- With no live offers in that city, the visitor sees a named empty state, the "Avise-me" capture, and the nearest cities that do have offers — never a blank grid.
+- With an unknown or deactivated city in the URL, the visitor sees the city selector with "Não encontramos essa cidade." and the response is a proper 404 status.
+- On a failed data load, the visitor sees "Não foi possível carregar as ofertas." with a retry — never an empty list implying there is nothing.
 
-### F3 — Supplier brand profile
+### F2 — Campaign page
 
-**Acceptance criteria**
-- The supplier can fill in brand name, legal name, CNPJ, logo, description and contacts and sees inline validation for CNPJ (check digits) and for logo size/format before submitting.
-- The supplier can save the profile and sees a success toast plus the updated logo in the header.
-- The supplier can submit an invalid CNPJ that passes client validation (e.g. via devtools) and the server rejects it with a field-level error — the row is never written.
-- An incomplete profile blocks campaign creation, and the supplier sees "Complete o perfil da marca para criar campanhas" with a link to the missing fields.
-
-### F4 — Campaign builder (supplier)
-
-A campaign carries: title, subtitle, description, the mechanic the restaurant must
-run, cover image, minimum purchase (amount + human description), **one national
-activation date**, enrollment window, proof deadline, optional restaurant cap,
-target cities, and suggested offer copy + default CTA.
+Route `/campanha/:slug`. The campaign's story, its date, and every participating
+restaurant in the visitor's selected city.
 
 **Acceptance criteria**
-- The supplier can create a campaign as `draft` and sees it listed under "Rascunhos" with an "Incompleta" badge until every required field is filled.
-- The supplier can select one or more cities from the admin-curated list and sees them as removable chips; saving with zero cities is blocked with "Selecione ao menos uma cidade".
-- The supplier can set an activation date in the future and sees an error if the enrollment window closes after it or if the proof deadline falls after the activation date.
-- The supplier can submit the campaign for review and sees status "Em análise" with all editing locked except cancel.
-- The supplier can see an approved campaign as "Publicada" with the count of restaurants enrolled and a countdown to the activation date.
-- The supplier cannot edit `min_order_amount` or `activation_date` after the first enrollment is approved and sees those fields disabled with the reason "Já existe restaurante aprovado nesta campanha".
+- The visitor can open a campaign page and sees the brand, the campaign story, the activation date and the participating restaurants with their individual offers.
+- The visitor can switch city on the page and sees the participating restaurants change without losing the campaign context.
+- The visitor can open a campaign whose date has passed and sees "Esta campanha já aconteceu." plus what is live now — status 200, never a 404, because the link is already shared.
+- The visitor can open a campaign that has no restaurant in the selected city and sees "Nenhum restaurante confirmado em {cidade} ainda." with a city switcher.
+- A visitor hitting an old slug after a rename is 301-redirected to the current URL.
+- An unknown slug returns a real 404 page in Portuguese with links to the live catalog.
 
-### F5 — Media Kit / Tool Kit upload and gating
+### F3 — Restaurant page
 
-**Acceptance criteria**
-- The supplier can upload multiple assets (banner, post, story, print, video, PDF guideline), reorder them, and sees per-file progress plus per-file error rows when one fails while the others continue.
-- The supplier can mark one asset as a public preview and sees it rendered on the campaign card; all others stay private.
-- The restaurant with an enrollment below `min_order_confirmed` sees the asset grid blurred with the lock message **"Materiais liberados após a compra mínima"** and no downloadable URL exists in the DOM or network response.
-- The restaurant with `min_order_confirmed` can download any asset individually or as a ZIP and sees the download start; the URL is a signed link that expires.
-- A signed URL that has expired returns a friendly "Link expirado, gere novamente" state rather than an XML storage error.
-
-### F6 — Restaurant discovery and multi-join in a single order
+Route `/restaurante/:slug`. Exists publicly from the restaurant's first published
+offer onwards (B4).
 
 **Acceptance criteria**
-- The restaurant can browse campaigns available for its own city and sees, per card, the brand, the activation date, the minimum purchase and how many restaurants already joined.
-- The restaurant can select several campaigns and sees a running "Sua seleção" summary with the total minimum purchase across them.
-- The restaurant can submit one order containing all selected campaigns and sees one confirmation listing every campaign with status "Aguardando aprovação do fornecedor".
-- The restaurant can open a campaign it already joined and sees the "Participar da campanha" button replaced by its current enrollment status.
-- The restaurant can reach a campaign that is full and sees "Vagas esgotadas" with the button disabled, both in the list and on the campaign page.
-- With no campaigns for its city, the restaurant sees "Ainda não há campanhas para a sua cidade" plus an option to be notified — not a blank grid.
-- Submitting an order where a campaign closed enrollment between page load and submit results in a partial result screen naming exactly which campaigns were accepted and which were not.
+- The visitor can open a restaurant page and sees its name, neighbourhood, city, cuisine, cover, Instagram, its live offers and its past campaigns.
+- The visitor can reach the page from any offer card in the catalog.
+- The visitor can open the page of a restaurant with no live offer and sees "Sem ofertas ativas no momento." plus its history and the city catalog — status 200.
+- An approved restaurant that has never published an offer has no public page: the URL returns 404 and the slug is absent from the sitemap.
 
-### F7 — Supplier approval of enrollments
+### F4 — Experiences
 
-**Acceptance criteria**
-- The supplier can see pending enrollments with restaurant name, city, neighbourhood, cuisine, opening date and Instagram, and sees the campaign's remaining capacity.
-- The supplier can approve an enrollment and sees it move to "Aprovadas"; the restaurant is notified and its next step becomes "Enviar comprovante".
-- The supplier can reject an enrollment with a mandatory reason and sees it move to "Recusadas" with the reason visible to that restaurant only.
-- The supplier can bulk-approve a selection and sees a per-row result, including which rows failed because capacity ran out mid-operation.
-- The supplier can see contact details (email, WhatsApp) of restaurants **only** after approving them; before approval the contact block shows "Disponível após aprovação".
-
-### F8 — Proof of minimum purchase
+Route `/experiencias/:cidade`, the same catalog filtered to `kind = 'experiencia'` (B2).
 
 **Acceptance criteria**
-- The approved restaurant can upload a proof (PDF, XML, JPG, PNG up to 10 MB), declare the amount, the purchase date, the distributor and optionally the NF-e key, and sees inline validation of the 44-digit key format.
-- The restaurant can submit the proof and sees status "Comprovante em análise" plus the file name and the deadline.
-- The restaurant can replace a rejected proof and sees the supplier's rejection reason above the upload field.
-- The supplier can open a proof, view the file inline, and approve or reject it with a reason; approving sets the enrollment to `min_order_confirmed`.
-- Approving a proof whose declared amount is below the campaign minimum requires an explicit confirmation ("Valor abaixo do mínimo. Confirmar mesmo assim?") and records who overrode it.
-- The restaurant that misses the proof deadline sees the enrollment as "Prazo encerrado" and the assets stay locked.
-- A proof file that fails to upload shows a retry action on that specific file and never leaves an enrollment in a half-submitted state.
+- The visitor can open `/experiencias/:cidade` and sees only experience-type campaigns in that city, with date and participating restaurants.
+- The visitor can see each experience carry `Event` structured data with its date, city and participating venues.
+- With no experiences in the city, the visitor sees "Ainda não há experiências em {cidade}." plus the offers catalog for the same city.
+- The page declares its own canonical and never duplicates `/ofertas/:cidade` in the index.
 
-### F9 — Asset unlock
+### F5 — Configurable CTA and click tracking
 
 **Acceptance criteria**
-- The restaurant whose enrollment reaches `min_order_confirmed` can open "Meus materiais" and sees every asset of that campaign unlocked, with the activation date pinned at the top.
-- The restaurant can only see assets of campaigns it has confirmed; requesting an asset from another campaign returns 403 from the edge function and the UI shows "Você não tem acesso a este material".
-- The restaurant can see, for a locked campaign, exactly what is missing ("Falta enviar o comprovante" / "Comprovante em análise") instead of a generic lock.
-
-### F10 — Offer editor (copy + CTA)
-
-**Acceptance criteria**
-- The restaurant with a confirmed enrollment can edit the offer headline, description, terms, optional image and the CTA (type + value) and sees a live preview of the public card exactly as the consumer will see it.
-- The restaurant can start from the supplier's suggested copy pre-filled and sees a "Restaurar sugestão do fornecedor" action.
-- The restaurant can choose CTA type WhatsApp and sees phone-mask validation; choosing iFood/site validates the URL server-side, and an invalid value is rejected even if the client is bypassed.
-- The restaurant can publish the offer and sees "Publicada — vai ao ar em DD/MM"; before the activation date the offer is not visible in the public catalog.
-- The restaurant can unpublish and sees the offer removed from the public catalog on the next request.
-- An offer missing the CTA cannot be published and the restaurant sees which field blocks it.
-
-### F11 — Public consumer catalog
-
-**Acceptance criteria**
-- Any visitor, logged out, can open the home page and sees the hero **"As melhores ofertas da sua cidade, no mesmo dia."** with a city selector.
-- The visitor can pick a city and sees only offers active in that city, ordered by activation date then by restaurant name; the choice persists in the URL and in local storage.
-- The visitor can share the URL and the recipient sees the same filtered result.
-- With no live offers in the chosen city, the visitor sees a named empty state offering the Clube signup and the nearest cities with offers.
-- The visitor on a slow connection sees skeleton cards, never layout shift when data arrives.
-- On a failed request, the visitor sees "Não foi possível carregar as ofertas" with a retry button, not an empty catalog implying there is nothing.
-
-### F12 — Campaign page and participating restaurants
-
-**Acceptance criteria**
-- The visitor can open a campaign page and sees the campaign story, the date, and every participating restaurant in the selected city with its individual offer.
-- The visitor can click a restaurant's CTA and is taken to the external destination in a new tab, with the click recorded.
-- The visitor can open a campaign whose date has passed and sees "Esta campanha já aconteceu" plus current campaigns, instead of a 404.
-- The header always offers **"Sou Restaurante"** and **"Sou Fornecedor"**.
-
-### F13 — Event tracking (views and CTA clicks)
-
-**Acceptance criteria**
-- A visitor scrolling the catalog generates one `offer_view` per offer per session, not one per scroll event.
-- A visitor clicking a CTA generates one `cta_click`, and the navigation still happens if the tracking request fails.
-- The tracking endpoint rejects events for offers that are not published and rate-limits by session hash; rejected events never reach the table.
+- The visitor can click an offer's CTA and is taken to the external destination in a new tab.
+- The click is recorded as `cta_click` before navigating, and **the navigation still happens if tracking fails**.
+- A visitor scrolling the catalog generates one `offer_view` per offer per session per day, not one per scroll event.
+- The tracking endpoint rejects events for offers that are not public and rate-limits by session hash; rejected events never reach the table.
 - No raw IP address is ever stored, and this is verifiable by reading the table.
+- An offer with a malformed destination hides the CTA and shows "Contato indisponível no momento." — never a broken link.
 
-### F14 — Supplier performance dashboard
-
-**Acceptance criteria**
-- The supplier can open a campaign dashboard and sees restaurants enrolled, restaurants confirmed, offer views and CTA clicks, with the conversion rate between views and clicks.
-- The supplier can see a per-restaurant table and sorts it by clicks or views.
-- The supplier can filter by city and by date range and sees the numbers update.
-- With a campaign that has not gone live, the supplier sees "Os dados aparecem após a data de ativação" instead of zeros presented as results.
-- The supplier can never see another supplier's numbers, and a crafted request for another campaign's metrics returns no rows.
-
-### F15 — Clube de Experiências (consumer)
+### F6 — SEO and share layer
 
 **Acceptance criteria**
-- The visitor can join the Clube with email and city and sees a confirmation; no password is required (magic link).
-- The member can save an offer and sees it under "Salvos", persisted across devices.
-- The member can unsubscribe in one click from any email and sees the confirmation page.
-- A visitor who is not a member sees the save icon and, on click, an inline signup instead of a hard redirect that loses the page.
+- A crawler can request `/ofertas/:cidade`, `/campanha/:slug`, `/restaurante/:slug` and `/experiencias/:cidade` and receives complete HTML with content, without executing JavaScript.
+- Every public page carries a unique `<title>`, a unique meta description built from its own data, and a self-referencing `<link rel="canonical">`.
+- A campaign page carries `Offer` JSON-LD, a restaurant page carries `Restaurant` JSON-LD, and an experience page carries `Event` JSON-LD — each validating in Google's Rich Results Test.
+- The developer can open `/sitemap.xml` and sees every active city, every published campaign and every indexable restaurant, with `lastmod` reflecting real changes.
+- The developer can open `/robots.txt` and sees the sitemap declared, the private areas (`/app`, `/admin`, `/fornecedor`, `/restaurante-area`) disallowed.
+- A page that must not be indexed (approved restaurant with no offer, draft, unpublished offer) emits `noindex` **and** is absent from the sitemap.
+- Pasting any public URL into WhatsApp shows a card with the campaign's own OG image, title and description — generated at publish time (B3), never a generic placeholder.
+- A renamed slug keeps the old URL working via 301, verifiable by requesting it.
 
-### F16 — Admin console
+---
+
+### Block B — Access and identity
+
+### F7 — Authentication and role routing
 
 **Acceptance criteria**
-- The admin can create, rename, activate and deactivate cities and sees the count of restaurants and campaigns attached before deactivating one.
-- The admin can review campaigns submitted by suppliers, approve or reject with a reason, and sees the change reflected on the supplier's side.
-- The admin can search restaurants and suppliers by name, CNPJ or city and sees paginated results.
-- The admin can open any enrollment and see its full history (requested, decided, proof, confirmation) with timestamps and actor.
-- Every approval, rejection and suspension the admin performs is written to an audit log the admin can read.
+- The user can sign up as restaurant or supplier and sees "Cadastro em análise", not a working dashboard.
+- The user can log in and lands in the area of their role, with no flash of another role's layout.
+- The user can hit a URL belonging to another role and sees a 403 page with a link back to their own area — never a blank screen, never the protected data.
+- The user can reload any private page and stays logged in on that page.
+- The user can request a password reset and sees the same confirmation whether or not the email exists (no account enumeration).
+- The user cannot change their own role from the client; the attempt fails server-side and the UI never offers it.
+- A logged-in user browsing the public catalog sees it exactly as an anonymous visitor does, plus a link to their area.
 
-### F17 — Cross-cutting (applies to every screen)
+### F8 — Admin approval of suppliers and restaurants
 
-- Every data screen implements **empty, loading, error and success** states, each with real Portuguese copy.
-- All colours, radii and spacing come from CSS variables in `index.css`, mapped into Tailwind; no hardcoded values in JSX.
-- All data access goes through the service layer in `src/services/`; components never call Supabase directly.
-- All destructive actions require confirmation naming the object being affected.
-- All forms are validated with a shared zod schema reused by the edge function for the same operation.
+**Acceptance criteria**
+- The admin can open "Cadastros pendentes" and sees suppliers and restaurants awaiting review with submission date, city and CNPJ.
+- The admin can approve an account and sees it move to "Aprovados"; the owner's next login lands on their working dashboard.
+- The admin can reject with a mandatory reason and sees it move to "Recusados"; the owner sees the reason verbatim and an "Editar cadastro" action that returns the account to `pending`.
+- The admin can suspend an approved account and sees its offers leave the public catalog on the next request.
+- With nothing pending, the admin sees "Nenhum cadastro aguardando análise." — not an empty table with headers.
+
+---
+
+### Block C — Restaurant
+
+### F9 — Discover campaigns
+
+**Acceptance criteria**
+- The restaurant can browse campaigns targeting its own city and sees, per card, the brand, the activation date, the minimum purchase and how many restaurants already joined.
+- The restaurant can open a campaign and sees **"Participar da campanha"**, replaced by its current status once enrolled.
+- The restaurant can see a full campaign marked "Vagas esgotadas" with the action disabled, and a closed one marked "Inscrições encerradas".
+- With no campaigns for its city, it sees "Ainda não há campanhas para a sua cidade." plus a notify action.
+- With everything already joined, it sees "Você já participa de todas as campanhas disponíveis." and a link to its campaigns.
+
+### F10 — Multi-join in a single order
+
+**Acceptance criteria**
+- The restaurant can select several campaigns and sees a running "Sua seleção" summary with each minimum purchase and the total.
+- The restaurant can submit one order covering the whole selection and sees a confirmation listing every campaign as "Aguardando aprovação do fornecedor".
+- When a campaign fills up between page load and submit, the restaurant sees a **partial result** naming exactly which campaigns were accepted and which were not, with the reason per campaign; accepted ones are kept.
+- The restaurant can submit with nothing selected and sees the action disabled with "Selecione ao menos uma campanha".
+- On a network failure mid-submit, the restaurant sees "Não conseguimos confirmar o envio." with a "Verificar status" action that reads real server state instead of resubmitting.
+
+### F11 — Proof of minimum purchase
+
+**Acceptance criteria**
+- The approved restaurant can upload a proof (PDF, XML, JPG, PNG up to 10 MB), declare amount, purchase date and distributor, optionally the NF-e key, and sees inline validation of the 44-digit format.
+- The restaurant can submit and sees "Comprovante em análise" with the file name and the deadline.
+- The restaurant that sends an NF-e key already used elsewhere sees "Esta nota já foi usada em outra campanha."
+- The restaurant can resend after a rejection and sees the supplier's reason above the upload field, with previous values pre-filled.
+- The restaurant that declares an amount below the minimum sees a warning before submitting and can still submit — the decision belongs to the supplier.
+- The restaurant that misses the deadline sees "Prazo encerrado", upload disabled, assets still locked.
+- A failed upload offers a retry on that specific file and never leaves the enrollment half-submitted.
+
+### F12 — Media Kit unlock
+
+**Acceptance criteria**
+- The restaurant below `min_order_confirmed` sees the asset grid blurred with **"Materiais liberados após a compra mínima"**, plus the exact missing step ("Falta enviar o comprovante" / "Comprovante em análise") — and no downloadable URL exists in the DOM or in any response.
+- The restaurant at `min_order_confirmed` can download any asset individually or as "Baixar tudo (.zip)".
+- The restaurant can request an asset from a campaign it has not confirmed and receives 403 from the edge function, seeing "Você não tem acesso a este material".
+- An expired signed URL shows "Link expirado, gere novamente" with a regenerate action, never a raw storage error.
+- With the enrollment confirmed but nothing uploaded yet, the restaurant sees "O fornecedor ainda não publicou os materiais."
+
+### F13 — Offer editor
+
+**Acceptance criteria**
+- The restaurant with a confirmed enrollment can edit headline, description, terms, optional image and CTA, and sees a live preview of the public card exactly as the consumer will see it.
+- The restaurant sees the supplier's suggested copy pre-filled and can always "Restaurar sugestão do fornecedor".
+- The restaurant choosing WhatsApp sees phone masking; choosing iFood or site has the URL validated **server-side too**, so a bypassed client still fails.
+- The restaurant can publish and sees "Publicada — vai ao ar em DD/MM"; the offer is not in the public catalog before the activation date.
+- The restaurant can unpublish and sees the offer leave the public catalog on the next request.
+- The restaurant cannot publish without a CTA and sees which field blocks it.
+- After the campaign date, the editor is read-only with "Campanha encerrada" plus its own views and clicks.
+
+---
+
+### Block D — Supplier
+
+### F14 — Brand profile
+
+**Acceptance criteria**
+- The supplier can fill brand name, legal name, CNPJ, logo, description and contacts, and sees inline validation of CNPJ check digits and of logo size/format.
+- The supplier can save and sees a success toast plus the logo in the header.
+- The supplier can bypass the client and submit an invalid CNPJ, and the server rejects it with a field-level error — the row is never written.
+- With an incomplete profile, the supplier sees "Complete o perfil da marca para criar campanhas" linked to the missing fields, and campaign creation is blocked.
+
+### F15 — Campaign builder
+
+**Acceptance criteria**
+- The supplier can create a campaign as draft, choose its kind (oferta or experiência), and sees it under "Rascunhos" with an "Incompleta" badge and a checklist of what is missing.
+- The supplier can select target cities from the curated list as removable chips; saving with none is blocked with "Selecione ao menos uma cidade".
+- The supplier sees field errors when the enrollment window closes after the activation date, when the proof deadline falls after it, or when the activation date is in the past.
+- The supplier can submit for curation and sees "Em análise" with everything locked except cancel.
+- The supplier sees a published campaign as "Publicada" with the enrolled count and a countdown to the activation date.
+- After the first approved enrollment, the supplier sees `min_order_amount` and `activation_date` disabled with "Já existe restaurante aprovado nesta campanha".
+- On publishing, the supplier can see the generated OG card preview and how the campaign will look when shared.
+
+### F16 — Media Kit upload
+
+**Acceptance criteria**
+- The supplier can upload multiple assets (banner, post, story, print, video, PDF), sees per-file progress, and one failing file does not abort the others.
+- The supplier can reorder assets by drag-and-drop, with the change reverted visibly if it fails.
+- The supplier can flag exactly one asset as a public teaser and sees it on the campaign card; every other asset stays private.
+- The supplier can delete an asset before publication and sees a confirmation naming the file; after publication deletion is blocked with the reason.
+- With nothing uploaded, the supplier sees "Nenhum material enviado. O restaurante só recebe os materiais depois da compra mínima."
+
+### F17 — Enrollment and proof approval
+
+**Acceptance criteria**
+- The supplier can see pending enrollments with restaurant name, city, neighbourhood, cuisine, opening date and Instagram, plus the campaign's remaining capacity.
+- The supplier sees contact details only after approving an enrollment; before that the block reads "Disponível após aprovação".
+- The supplier can approve or reject with a mandatory reason, and can bulk-approve with a per-row result including rows that failed because capacity ran out mid-operation.
+- The supplier can open a proof, view the file inline next to the campaign minimum, and approve or reject it.
+- Approving a proof below the minimum requires confirming "Valor abaixo do mínimo. Confirmar mesmo assim?" and records who overrode it.
+- Approving a proof unlocks the assets for that restaurant immediately.
+- An overdue enrollment is read-only for the supplier; only an admin can unblock it, and it is audited.
+
+### F18 — Performance dashboard
+
+**Acceptance criteria**
+- The supplier can open a campaign dashboard and sees restaurants enrolled, restaurants confirmed, offer views, CTA clicks and the view→click rate.
+- The supplier can filter by city and date range and sees the numbers update.
+- The supplier can sort the per-restaurant table by views or clicks.
+- Before the activation date, the supplier sees "Os dados aparecem após a data de ativação" alongside the enrollment counts — zeros are never presented as results.
+- The supplier can never see another supplier's numbers, and a crafted request for another campaign returns no rows.
+
+---
+
+### Block E — Admin and cross-cutting
+
+### F19 — Admin console
+
+**Acceptance criteria**
+- The admin can create, rename, activate and deactivate cities, and sees how many restaurants and campaigns are attached before deactivating one.
+- The admin can review submitted campaigns in a preview identical to the public page, and approve or reject with a reason.
+- The admin can take a published campaign down with a reason and sees its offers leave the public catalog.
+- The admin can search restaurants and suppliers by name, CNPJ or city with pagination, and sees "Nenhum resultado para "{termo}"." when there is none.
+- The admin can open any enrollment and see its full history — requested, decided, proof, confirmation — with timestamp and actor.
+- The admin can read an audit log of every approval, rejection, suspension, takedown and manual override, and cannot edit or delete any entry.
+
+### F20 — Design system contract
+
+Non-negotiable: **blue is action, orange is identity.**
+
+**Acceptance criteria**
+- A reviewer can grep `src/**/*.tsx` for hex colours, `rounded-[`, and arbitrary spacing values and finds none — every colour, radius and spacing comes from a CSS variable in `index.css` mapped into Tailwind.
+- A reviewer can inspect every button, link, focus ring and selected state and finds Google blue (`--blue-600` / `--blue-700` / `--blue-050`); **no orange CTA exists anywhere in the product**.
+- A reviewer can find `--brand-600` used only in the logo, the **"Campanha ativa"** badge, headline underlines and highlight icons.
+- A reviewer can change `--brand-600` in `index.css` and sees the whole brand shift with no other file touched.
+- The user sees pill buttons (`--radius-pill`), cards at `--radius-card`, and 1px `--outline` borders instead of heavy shadows, on every screen.
+- The user on mobile sees 64px between sections; on desktop 96–128px; the 8pt grid holds throughout.
+- Body text never exceeds ~70 characters per line; headlines are 48–72px on desktop with tight tracking.
+- No decorative gradient, no coloured shadow, no emoji used as an icon, and no row of three symmetric generic-icon cards exists in the product.
+
+### F21 — Cross-cutting behaviour
+
+- Every data screen implements **empty, loading, error and success** states with real Portuguese copy.
+- All data access goes through `src/services/`; components never call Supabase directly.
+- Every write validated by a shared zod schema reused by the corresponding edge function.
+- Every destructive action confirms while naming the object affected.
+- Public pages are server-rendered; private areas are client-rendered in the same build.
 
 ---
 
 ## 2. Explicitly out of v1
 
-Listed so nobody has to guess. These are backlog, not rejections.
+**From the brief:** points/gamification, full restaurant microsites, in-app chat,
+payments, native mobile app, consumer event ticketing.
 
-**From the brief:**
-1. Points, badges, gamification, restaurant ranking.
-2. Full restaurant microsites (own domain, menu, gallery).
-3. In-app chat between supplier and restaurant.
-4. Payments, invoicing, split, subscription billing.
-5. Native mobile app.
-6. Consumer event ticketing for the Clube.
+**From the decisions above:**
+1. **Clube de Experiências** — login, saved offers, city alerts, exclusive events (A7). v1 captures emails only.
+2. Multi-user teams per company (A3).
+3. Chains with multiple units (A4).
+4. Automated NF-e / ERP validation (A1).
+5. Restaurant-chosen or recurring campaign dates (A2).
+6. Vouchers, redemption codes, counter validation (A5).
+7. A separate `experiences` entity with venue, capacity and RSVP (B2).
 
-**Added from the decisions above:**
-7. Multi-user teams per company (invites, roles inside a company) — A3.
-8. Chains with multiple units under one account — A4.
-9. Automated NF-e validation against SEFAZ — A1.
-10. Restaurant-chosen activation dates or recurring campaigns — A2.
-11. Vouchers, redemption codes, counter validation, redemption reporting — A5.
-
-**Added from scoping:**
-12. Map / geolocation / "perto de mim" search — city filter only.
-13. Consumer reviews, ratings or comments on offers.
-14. Waiting list when a campaign is full.
-15. Supplier-to-restaurant broadcast messaging or push notifications.
-16. Asset personalisation (auto-generating a banner with the restaurant's logo).
-17. Public API, exports beyond a simple CSV, BI integrations.
-18. Internationalisation — Portuguese only, no i18n framework.
-19. WhatsApp Business API integration (the CTA is a plain `wa.me` link).
-20. Soft-delete/restore UI — deletions are status changes, purge is manual.
+**From scoping:**
+8. Map / geolocation / "perto de mim" — city filter only.
+9. Consumer reviews, ratings or comments.
+10. Waiting list when a campaign is full.
+11. Supplier→restaurant broadcast or push notifications.
+12. Asset personalisation (auto-compositing the restaurant's logo into a banner).
+13. Public API, BI integrations, exports beyond a simple CSV.
+14. Internationalisation — `pt-BR` only.
+15. WhatsApp Business API (the CTA is a plain `wa.me` link).
+16. Paid media / UTM campaign management inside the product.
+17. Soft-delete/restore UI — deletions are status changes; purge is manual.
+18. AMP, native app indexing, or any second rendering target.
 
 ---
 
 ## 3. Definition of done for v1
 
-The v1 is shippable when a real supplier can create a campaign, three real
-restaurants in one city can join it in a single order, upload proof, get confirmed,
-unlock the Media Kit, publish their offers, and a consumer with no account can open
-the catalog on a phone, filter by that city, and click through to WhatsApp — with
-the supplier seeing those clicks in the dashboard the next morning, and with every
-RLS policy verified by a test that attempts the forbidden read and fails.
+A person in São Paulo searches for something to do on a Thursday, lands on
+`/ofertas/sao-paulo` from Google, sees six restaurants running the same campaign that
+day with a **"Campanha ativa"** badge, taps a CTA and opens WhatsApp — while the
+supplier that funded it sees those clicks in its dashboard the next morning, the
+restaurant that published it got the Media Kit only after its proof was approved, and
+every RLS policy has a test that attempts the forbidden read and fails.
